@@ -1,0 +1,15 @@
+apiVersion: config.ratify.deislabs.io/v1beta1
+kind: Verifier
+metadata:
+  name: package-checker
+spec:
+  name: kubecon-demo
+  artifactTypes: application/spdx+json
+  parameters:
+    disAllowedLicenses:
+      - AGPL-3.0-or-later
+    disAllowedPackages:
+      - name: "github.com/mitchellh/mapstructure"
+        version: "v1.5.0"
+  source:
+    artifact: kubeconeu.azurecr.io/ratify/package-checker:v0.0.0-alpha.0

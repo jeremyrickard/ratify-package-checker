@@ -1,0 +1,124 @@
+name: SLSA go releaser
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "*"
+
+permissions: read-all
+
+jobs:
+  # Generate ldflags dynamically.
+  # Optional: only needed for ldflags.
+  args:
+    runs-on: ubuntu-latest
+    outputs:
+      commit-date: ${{ steps.ldflags.outputs.commit-date }}
+      commit: ${{ steps.ldflags.outputs.commit }}
+      version: ${{ steps.ldflags.outputs.version }}
+      tree-state: ${{ steps.ldflags.outputs.tree-state }}
+    steps:
+      - id: checkout
+        uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579 # tag=v2.3.4
+        with:
+          fetch-depth: 0
+      - id: ldflags
+        run: |
+          echo "commit-date=$(git log --date=iso8601-strict -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+          echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$(git describe --tags --always --dirty | cut -c2-)" >> "$GITHUB_OUTPUT"
+          echo "tree-state=$(if git diff --quiet; then echo "clean"; else echo "dirty"; fi)" >> "$GITHUB_OUTPUT"
+  # Trusted builder.
+  build:
+    permissions:
+      id-token: write # To sign the provenance.
+      contents: write # To upload assets to release.
+      actions: read # To read the workflow path.
+    needs: args
+    uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v1.5.0
+    with:
+      go-version: 1.19
+      # Optional: only needed if using ldflags.
+      evaluated-envs: "COMMIT_DATE:${{needs.args.outputs.commit-date}}, COMMIT:${{needs.args.outputs.commit}}, VERSION:${{needs.args.outputs.version}}, TREE_STATE:${{needs.args.outputs.tree-state}}"
+  docker:
+    permissions:
+      id-token: write # To sign the provenance.
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Setup Go environment 
+        uses: actions/setup-go@v4
+      - uses: Azure/login@v1
+        with:
+          creds: '{"clientId":"${{ secrets.CLIENT_ID }}","clientSecret":"${{ secrets.CLIENT_SECRET }}","subscriptionId":"${{ secrets.SUBSCRIPTION_ID }}","tenantId":"${{ secrets.TENANT_ID }}"}'
+      - name: Login to Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY_URL }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@main
+        with:
+          cosign-release: 'v2.0.1'
+      - name: Install Notation
+        uses: Duffney/setup-notation@v1.0.0
+        with:
+          version: 1.0.0-rc.3
+          plugin_name: notation-azure-kv
+          plugin_version:  0.5.0-rc.1
+          key_name: jeremyrickard-github-io
+          certificate_key_id: https://kubecon-demo.vault.azure.net/keys/jeremyrickard-github-io/c25cd49c71d242e09983ed7dbb995f8c
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          # list of Docker images to use as base name for tags
+          images: kubeconeu.azurecr.io/demo-app
+          tags: type=sha,format=long
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Build and Push container images
+        uses: docker/build-push-action@v2
+        with:
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Sign image with a OIDC Token
+        run: |
+          cosign sign --yes ${TAGS}
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+      - name: Sign With Notation
+        run: |
+          notation key list
+          notation sign --key jeremyrickard-github-io ${TAGS}
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          NOTATION_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          NOTATION_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      - name: Install ORAS
+        run: |
+          VERSION="1.0.0"
+          curl -LO "https://github.com/oras-project/oras/releases/download/v${VERSION}/oras_${VERSION}_linux_amd64.tar.gz"
+          mkdir -p oras-install/
+          tar -zxf oras_${VERSION}_*.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          rm -rf oras_${VERSION}_*.tar.gz oras-install/
+      - name: clone
+        uses: actions/checkout@v3
+      - name: Install BOM
+        run: |
+          go install sigs.k8s.io/bom/cmd/bom@latest
+      - name: Generate Project SBOM
+        run: |
+          bom generate --format json -o bom.json .
+      - name: ORAS attach the SBOM
+        run: |
+          oras attach --artifact-type application/spdx+json ${TAGS} bom.json
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+
